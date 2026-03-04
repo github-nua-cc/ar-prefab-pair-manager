@@ -1,29 +1,33 @@
-﻿using System;
+// PrefabImagePairManager.cs (Unity 6 / AR Foundation 6 ready)
+// Author: rewritten from the user's original script for modern ARF 6 usage.
+// Notes:
+//  - Uses ARTrackedImageManager events for added/updated/removed
+//  - Spawns one prefab per XRReferenceImage GUID and keeps it parented to the tracked image transform
+//  - Toggles active state based on TrackingState to avoid destroy/recreate churn
+//  - Preserves public API: GetPrefabForReferenceImage / SetPrefabForReferenceImage
+//  - Keeps a serialized backing list for the GUID→Prefab map for inspector persistence
+
+using System;
 using System.Collections.Generic;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
 using UnityEngine;
-using UnityEngine.UI;
-using UnityEngine.XR.ARSubsystems;
 using UnityEngine.XR.ARFoundation;
+using UnityEngine.XR.ARSubsystems;
 
 namespace UnityEngine.XR.ARFoundation.Samples
 {
-    /// <summary>
-    /// This component listens for images detected by the <c>XRImageTrackingSubsystem</c>
-    /// and overlays some prefabs on top of the detected image.
-    /// </summary>
+    [DisallowMultipleComponent]
     [RequireComponent(typeof(ARTrackedImageManager))]
     public class PrefabImagePairManager : MonoBehaviour, ISerializationCallbackReceiver
     {
-        /// <summary>
-        /// Used to associate an `XRReferenceImage` with a Prefab by using the `XRReferenceImage`'s guid as a unique identifier for a particular reference image.
-        /// </summary>
+        // ---------- Serialized data for inspector persistence ----------
+
         [Serializable]
         struct NamedPrefab
         {
-            // System.Guid isn't serializable, so we store the Guid as a string. At runtime, this is converted back to a System.Guid
+            // Keep Guid as string for Unity serialization
             public string imageGuid;
             public GameObject imagePrefab;
 
@@ -34,20 +38,25 @@ namespace UnityEngine.XR.ARFoundation.Samples
             }
         }
 
-        [SerializeField]
-        [HideInInspector]
-        List<NamedPrefab> m_PrefabsList = new List<NamedPrefab>();
+        // Backing list for Unity serialization
+        [SerializeField, HideInInspector]
+        private List<NamedPrefab> m_PrefabsList = new List<NamedPrefab>();
 
-        Dictionary<Guid, GameObject> m_PrefabsDictionary = new Dictionary<Guid, GameObject>();
-        Dictionary<Guid, GameObject> m_Instantiated = new Dictionary<Guid, GameObject>();
-        ARTrackedImageManager m_TrackedImageManager;
+        // Runtime map: XRReferenceImage.Guid → Prefab
+        private Dictionary<Guid, GameObject> m_PrefabsByGuid = new Dictionary<Guid, GameObject>();
 
-        [SerializeField]
-        [Tooltip("Reference Image Library")]
-        XRReferenceImageLibrary m_ImageLibrary;
+        // Runtime instances: XRReferenceImage.Guid → Spawned instance
+        private readonly Dictionary<Guid, GameObject> m_InstancesByGuid = new Dictionary<Guid, GameObject>();
+
+        // ---------- Dependencies ----------
+
+        private ARTrackedImageManager m_TrackedImageManager;
+
+        [SerializeField, Tooltip("Reference Image Library used by ARTrackedImageManager")]
+        private XRReferenceImageLibrary m_ImageLibrary;
 
         /// <summary>
-        /// Get the <c>XRReferenceImageLibrary</c>
+        /// Reference to the XRReferenceImageLibrary (exposed in case you set it at runtime).
         /// </summary>
         public XRReferenceImageLibrary imageLibrary
         {
@@ -55,165 +64,272 @@ namespace UnityEngine.XR.ARFoundation.Samples
             set => m_ImageLibrary = value;
         }
 
+        // ---------- Unity lifecycle ----------
+
+        private void Awake()
+        {
+            m_TrackedImageManager = GetComponent<ARTrackedImageManager>();
+        }
+
+        private void OnEnable()
+        {
+            if (m_TrackedImageManager == null)
+            {
+                m_TrackedImageManager = GetComponent<ARTrackedImageManager>();
+            }
+
+            if (m_ImageLibrary != null && m_TrackedImageManager != null)
+            {
+                // Ensure the manager is pointing at the configured library
+                m_TrackedImageManager.referenceLibrary = m_ImageLibrary;
+            }
+
+            m_TrackedImageManager.trackedImagesChanged += OnTrackedImagesChanged;
+        }
+
+        private void OnDisable()
+        {
+            if (m_TrackedImageManager != null)
+            {
+                m_TrackedImageManager.trackedImagesChanged -= OnTrackedImagesChanged;
+            }
+        }
+
+        // ---------- Serialization bridging ----------
+
         public void OnBeforeSerialize()
         {
+            // Push dictionary → list for serialization
             m_PrefabsList.Clear();
-            foreach (var kvp in m_PrefabsDictionary)
+            foreach (var kv in m_PrefabsByGuid)
             {
-                m_PrefabsList.Add(new NamedPrefab(kvp.Key, kvp.Value));
+                m_PrefabsList.Add(new NamedPrefab(kv.Key, kv.Value));
             }
         }
 
         public void OnAfterDeserialize()
         {
-            m_PrefabsDictionary = new Dictionary<Guid, GameObject>();
+            // Pull list → dictionary for runtime use
+            m_PrefabsByGuid = new Dictionary<Guid, GameObject>(m_PrefabsList.Count);
             foreach (var entry in m_PrefabsList)
             {
-                m_PrefabsDictionary.Add(Guid.Parse(entry.imageGuid), entry.imagePrefab);
+                if (!string.IsNullOrEmpty(entry.imageGuid) && Guid.TryParse(entry.imageGuid, out var guid))
+                {
+                    if (!m_PrefabsByGuid.ContainsKey(guid))
+                        m_PrefabsByGuid.Add(guid, entry.imagePrefab);
+                }
             }
         }
 
-        void Awake()
-        {
-            m_TrackedImageManager = GetComponent<ARTrackedImageManager>();
-        }
+        // ---------- Public API retained ----------
 
-        void OnEnable()
-        {
-            m_TrackedImageManager.trackedImagesChanged += OnTrackedImagesChanged;
-        }
+        public GameObject GetPrefabForReferenceImage(in XRReferenceImage referenceImage) =>
+            m_PrefabsByGuid.TryGetValue(referenceImage.guid, out var prefab) ? prefab : null;
 
-        void OnDisable()
+        public void SetPrefabForReferenceImage(in XRReferenceImage referenceImage, GameObject alternativePrefab)
         {
-            m_TrackedImageManager.trackedImagesChanged -= OnTrackedImagesChanged;
-        }
+            m_PrefabsByGuid[referenceImage.guid] = alternativePrefab;
 
-        void OnTrackedImagesChanged(ARTrackedImagesChangedEventArgs eventArgs)
-        {
-            foreach (var trackedImage in eventArgs.added)
+            if (m_InstancesByGuid.TryGetValue(referenceImage.guid, out var existing))
             {
-                // Give the initial image a reasonable default scale
-                // var minLocalScalar = Mathf.Min(trackedImage.size.x, trackedImage.size.y) / 2;
-                // trackedImage.transform.localScale = new Vector3(minLocalScalar, minLocalScalar, minLocalScalar);
-                AssignPrefab(trackedImage);
+                // Swap the live instance without losing the parent/pose
+                var parent = existing.transform.parent;
+                var pose = existing.transform.localToWorldMatrix;
+                Destroy(existing);
+
+                var newInstance = InstantiateSafe(alternativePrefab, parent);
+                if (newInstance != null)
+                {
+                    newInstance.transform.SetPositionAndRotation(parent.position, parent.rotation);
+                    m_InstancesByGuid[referenceImage.guid] = newInstance;
+                }
             }
         }
 
-        void AssignPrefab(ARTrackedImage trackedImage)
-        {
-            if (m_PrefabsDictionary.TryGetValue(trackedImage.referenceImage.guid, out var prefab))
-                
-                // JG 
-                m_Instantiated[trackedImage.referenceImage.guid] = Instantiate(prefab, trackedImage.transform);
-                // m_Instantiated[trackedImage.referenceImage.guid] = Instantiate(prefab, trackedImage.transform.position, trackedImage.transform.rotation, trackedImage.transform.parent);
-                
-        }
+        // ---------- Event handling ----------
 
-        public GameObject GetPrefabForReferenceImage(XRReferenceImage referenceImage)
-            => m_PrefabsDictionary.TryGetValue(referenceImage.guid, out var prefab) ? prefab : null;
-
-        public void SetPrefabForReferenceImage(XRReferenceImage referenceImage, GameObject alternativePrefab)
+        private void OnTrackedImagesChanged(ARTrackedImagesChangedEventArgs args)
         {
-            m_PrefabsDictionary[referenceImage.guid] = alternativePrefab;
-            if (m_Instantiated.TryGetValue(referenceImage.guid, out var instantiatedPrefab))
+            // Added: create instances and bind to the tracked image transform
+            foreach (var added in args.added)
             {
-                m_Instantiated[referenceImage.guid] = Instantiate(alternativePrefab, instantiatedPrefab.transform.parent);
-                Destroy(instantiatedPrefab);
+                EnsureInstanceFor(added);
+                UpdateVisibility(added);
+                UpdateTransform(added);
             }
+
+            // Updated: toggle visibility & keep alignment
+            foreach (var updated in args.updated)
+            {
+                EnsureInstanceFor(updated); // in case late-spawn after dictionary changes
+                UpdateVisibility(updated);
+                UpdateTransform(updated);
+            }
+
+            // Removed: clean up instances (optional: pool instead of destroy)
+            foreach (var removed in args.removed)
+            {
+                DestroyInstanceFor(removed);
+            }
+        }
+
+        // ---------- Helpers ----------
+
+        private void EnsureInstanceFor(ARTrackedImage trackedImage)
+        {
+            var guid = trackedImage.referenceImage.guid;
+
+            // Already created?
+            if (m_InstancesByGuid.ContainsKey(guid) && m_InstancesByGuid[guid] != null)
+                return;
+
+            // Find prefab to spawn
+            if (!m_PrefabsByGuid.TryGetValue(guid, out var prefab) || prefab == null)
+                return;
+
+            // Parent to tracked image so pose updates for free
+            var instance = InstantiateSafe(prefab, trackedImage.transform);
+            if (instance == null)
+                return;
+
+            // Optional: set an initial uniform scale relative to the detected image size
+            // var minScalar = Mathf.Min(trackedImage.size.x, trackedImage.size.y) * 0.5f;
+            // trackedImage.transform.localScale = Vector3.one * minScalar;
+
+            m_InstancesByGuid[guid] = instance;
+        }
+
+        private void UpdateTransform(ARTrackedImage trackedImage)
+        {
+            // Because the instance is a child of the tracked image, normal pose updates
+            // are handled automatically by ARFoundation. Still, you could enforce
+            // alignment logic here if needed (e.g., offset, rotation lock).
+            // Example:
+            // var t = trackedImage.transform;
+            // t.localPosition = Vector3.zero;
+            // t.localRotation = Quaternion.identity;
+        }
+
+        private void UpdateVisibility(ARTrackedImage trackedImage)
+        {
+            var guid = trackedImage.referenceImage.guid;
+            if (!m_InstancesByGuid.TryGetValue(guid, out var instance) || instance == null)
+                return;
+
+            // Toggle active state based on tracking quality
+            var visible = trackedImage.trackingState == TrackingState.Tracking;
+            if (instance.activeSelf != visible)
+                instance.SetActive(visible);
+        }
+
+        private void DestroyInstanceFor(ARTrackedImage trackedImage)
+        {
+            var guid = trackedImage.referenceImage.guid;
+            if (m_InstancesByGuid.TryGetValue(guid, out var instance) && instance != null)
+            {
+                Destroy(instance);
+            }
+            m_InstancesByGuid.Remove(guid);
+        }
+
+        private static GameObject InstantiateSafe(GameObject prefab, Transform parent)
+        {
+            if (prefab == null) return null;
+            var go = Instantiate(prefab, parent);
+            go.name = $"{prefab.name} (ImageInstance)";
+            return go;
         }
 
 #if UNITY_EDITOR
-        /// <summary>
-        /// This customizes the inspector component and updates the prefab list when
-        /// the reference image library is changed.
-        /// </summary>
+        // -------- Inspector: keeps mapping in sync with the selected library --------
+
         [CustomEditor(typeof(PrefabImagePairManager))]
         class PrefabImagePairManagerInspector : Editor
         {
-            List<XRReferenceImage> m_ReferenceImages = new List<XRReferenceImage>();
-            bool m_IsExpanded = true;
+            private List<XRReferenceImage> m_ReferenceImages = new();
+            private bool m_ListExpanded = true;
 
-            bool HasLibraryChanged(XRReferenceImageLibrary library)
+            public override void OnInspectorGUI()
             {
-                if (library == null)
-                    return m_ReferenceImages.Count == 0;
+                var behaviour = (PrefabImagePairManager)serializedObject.targetObject;
+                serializedObject.Update();
 
-                if (m_ReferenceImages.Count != library.count)
-                    return true;
+                using (new EditorGUI.DisabledScope(true))
+                {
+                    EditorGUILayout.ObjectField("Script", MonoScript.FromMonoBehaviour(behaviour), typeof(MonoScript), false);
+                }
 
+                // Image Library field
+                var libraryProp = serializedObject.FindProperty("m_ImageLibrary");
+                EditorGUILayout.PropertyField(libraryProp);
+                var library = libraryProp.objectReferenceValue as XRReferenceImageLibrary;
+
+                // When library changes, refresh the dictionary with existing values where possible
+                if (LibraryChanged(library))
+                {
+                    var newMap = new Dictionary<Guid, GameObject>();
+                    if (library != null)
+                    {
+                        foreach (var ri in library)
+                        {
+                            newMap[ri.guid] = behaviour.GetPrefabForReferenceImage(ri);
+                        }
+                    }
+                    behaviour.m_PrefabsByGuid = newMap;
+                }
+
+                // Cache current library contents
+                m_ReferenceImages.Clear();
+                if (library != null)
+                {
+                    foreach (var ri in library)
+                        m_ReferenceImages.Add(ri);
+                }
+
+                // Prefab list UI
+                if (library != null)
+                {
+                    m_ListExpanded = EditorGUILayout.Foldout(m_ListExpanded, "Prefab List");
+                    if (m_ListExpanded)
+                    {
+                        using (new EditorGUI.IndentLevelScope())
+                        {
+                            EditorGUI.BeginChangeCheck();
+                            var temp = new Dictionary<Guid, GameObject>(library.count);
+                            foreach (var ri in library)
+                            {
+                                var current = behaviour.m_PrefabsByGuid.TryGetValue(ri.guid, out var v) ? v : null;
+                                var next = (GameObject)EditorGUILayout.ObjectField(ri.name, current, typeof(GameObject), false);
+                                temp[ri.guid] = next;
+                            }
+
+                            if (EditorGUI.EndChangeCheck())
+                            {
+                                Undo.RecordObject(target, "Update Prefab Map");
+                                behaviour.m_PrefabsByGuid = temp;
+                                EditorUtility.SetDirty(target);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    EditorGUILayout.HelpBox("Assign an XRReferenceImageLibrary to map images to prefabs.", MessageType.Info);
+                }
+
+                serializedObject.ApplyModifiedProperties();
+            }
+
+            private bool LibraryChanged(XRReferenceImageLibrary library)
+            {
+                if (library == null) return m_ReferenceImages.Count != 0;
+                if (m_ReferenceImages.Count != library.count) return true;
                 for (int i = 0; i < library.count; i++)
                 {
                     if (m_ReferenceImages[i] != library[i])
                         return true;
                 }
-
                 return false;
-            }
-
-            public override void OnInspectorGUI()
-            {
-                //customized inspector
-                var behaviour = serializedObject.targetObject as PrefabImagePairManager;
-
-                serializedObject.Update();
-                using (new EditorGUI.DisabledScope(true))
-                {
-                    EditorGUILayout.PropertyField(serializedObject.FindProperty("m_Script"));
-                }
-
-                var libraryProperty = serializedObject.FindProperty(nameof(m_ImageLibrary));
-                EditorGUILayout.PropertyField(libraryProperty);
-                var library = libraryProperty.objectReferenceValue as XRReferenceImageLibrary;
-
-                //check library changes
-                if (HasLibraryChanged(library))
-                {
-                    if (library)
-                    {
-                        var tempDictionary = new Dictionary<Guid, GameObject>();
-                        foreach (var referenceImage in library)
-                        {
-                            tempDictionary.Add(referenceImage.guid, behaviour.GetPrefabForReferenceImage(referenceImage));
-                        }
-                        behaviour.m_PrefabsDictionary = tempDictionary;
-                    }
-                }
-
-                // update current
-                m_ReferenceImages.Clear();
-                if (library)
-                {
-                    foreach (var referenceImage in library)
-                    {
-                        m_ReferenceImages.Add(referenceImage);
-                    }
-                }
-
-                //show prefab list
-                m_IsExpanded = EditorGUILayout.Foldout(m_IsExpanded, "Prefab List");
-                if (m_IsExpanded)
-                {
-                    using (new EditorGUI.IndentLevelScope())
-                    {
-                        EditorGUI.BeginChangeCheck();
-
-                        var tempDictionary = new Dictionary<Guid, GameObject>();
-                        foreach (var image in library)
-                        {
-                            var prefab = (GameObject) EditorGUILayout.ObjectField(image.name, behaviour.m_PrefabsDictionary[image.guid], typeof(GameObject), false);
-                            tempDictionary.Add(image.guid, prefab);
-                        }
-
-                        if (EditorGUI.EndChangeCheck())
-                        {
-                            Undo.RecordObject(target, "Update Prefab");
-                            behaviour.m_PrefabsDictionary = tempDictionary;
-                            EditorUtility.SetDirty(target);
-                        }
-                    }
-                }
-
-                serializedObject.ApplyModifiedProperties();
             }
         }
 #endif
